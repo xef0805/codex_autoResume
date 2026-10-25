@@ -1,6 +1,7 @@
-"""Deterministic monitoring: only a confirmed five-hour quota failure can resume."""
+"""Deterministic monitoring: only a confirmed quota failure can resume."""
 from datetime import datetime, timedelta, timezone
 import json
+import re
 from pathlib import Path
 
 RESUME_PROMPT = (
@@ -48,8 +49,14 @@ def ordinary_usage_ready(usage):
 def quota_failure(turn):
     if turn.get("status") != "failed":
         return False
-    info = (turn.get("error") or {}).get("codexErrorInfo")
-    return isinstance(info, str) and info.lower() == "usagelimitexceeded"
+    error = turn.get("error") or {}
+    info = error.get("codexErrorInfo")
+    if info is not None:
+        return isinstance(info, str) and info.lower() == "usagelimitexceeded"
+    # App-tools can omit codexErrorInfo. Match only the actual turn error,
+    # never assistant text or arbitrary mentions of a rate limit.
+    return bool(re.match(r"^you['’]ve hit your usage limit(?:[.!:\s]|$)",
+                         error.get("message", ""), re.IGNORECASE))
 
 
 def quota_description(usage):
@@ -64,6 +71,7 @@ class Monitor:
         self.path = Path(state_path)
         self.rpc = rpc
         self.stopped = stopped
+        self.current_usage = None
         self.state = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
     def save(self):
@@ -77,6 +85,7 @@ class Monitor:
 
     def bind(self, thread_id):
         usage = self.rpc("get_usage_limits", {})
+        self.current_usage = usage
         if not usage.get("accountId"):
             raise RuntimeError("无法确认登录账号；未开启监控。")
         if self.state.get("threadId") != thread_id or self.state.get("accountId") != usage["accountId"]:
@@ -94,6 +103,10 @@ class Monitor:
         if self.stopped.is_set():
             return "监控已停止"
         snapshot = self.read_latest()
+        usage = self.rpc("get_usage_limits", {})
+        self.current_usage = usage
+        if usage.get("accountId") != self.state["accountId"]:
+            raise StopMonitoring("登录账号发生变化；已停止监控，请重新选择聊天。")
         thread = snapshot.get("thread", {})
         turns = snapshot.get("turns", [])
         if thread.get("kind") != "codex" or thread.get("hostId") != "local":
@@ -110,28 +123,28 @@ class Monitor:
         if status not in ("idle", "notLoaded", "systemError"):
             return "聊天状态不明确，暂不续跑"
         if not quota_failure(latest):
-            return "正在监控：没有因额度耗尽而失败的任务"
+            if latest.get("status") == "completed":
+                return "正在监控：最近一轮已完成，等待新的额度中断"
+            if latest.get("status") == "interrupted":
+                return "正在监控：最近一轮被中断，不自动续跑"
+            return "正在监控：最近一轮不是已识别的额度失败，不自动续跑"
         if not latest.get("id"):
             return "无法确认失败记录，暂不续跑"
         key = self.state["threadId"] + ":" + latest["id"]
         attempts = self.state.setdefault("attempts", {})
         if key in attempts:
             return "该次中断已处理或发送结果待核实；不会重复发送"
-        usage = self.rpc("get_usage_limits", {})
-        if usage.get("accountId") != self.state["accountId"]:
-            raise StopMonitoring("登录账号发生变化；已停止监控，请重新选择聊天。")
         window = five_hour_window(usage)
         if window is None:
             return "无法确认 5 小时额度状态，暂不续跑"
-        if window["usedPercent"] >= 100:
+        if self.state.get("pending") != latest["id"]:
             self.state["pending"] = latest["id"]
             self.save()
+        if window["usedPercent"] >= 100:
             reset = window.get("resetsAt")
             when = (datetime.fromtimestamp(reset, timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
                     if isinstance(reset, (int, float)) else "未知")
             return "已确认额度中断，等待恢复（预计北京时间 {}）".format(when)
-        if self.state.get("pending") != latest["id"]:
-            return "未观察到该次失败时的 5 小时额度耗尽状态，暂不续跑"
         if not ordinary_usage_ready(usage):
             return "5 小时额度已变化，但账号仍不可用（可能受周额度等限制），继续等待"
         # Re-read immediately before sending: manual continuation or stopping cancels this retry.

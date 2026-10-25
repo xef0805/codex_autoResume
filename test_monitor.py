@@ -23,6 +23,14 @@ def snapshot(status="failed", code="usageLimitExceeded", turn_id="turn-1", activ
                        "error": {"codexErrorInfo": code}}]}
 
 
+# Actual app-tools error shape from 2026-10-25, with private turn data removed.
+RECORDED_QUOTA_ERROR = {
+    "message": "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+               "visit https://chatgpt.com/settings/usage to purchase more credits or try again at 7:12 PM.",
+    "additionalDetails": None,
+}
+
+
 class FakeDesktop:
     def __init__(self):
         self.usage = usage()
@@ -104,9 +112,71 @@ class MonitorTests(unittest.TestCase):
         self.monitor.tick()
         self.assertEqual(self.desktop.messages, [])
 
-    def test_old_failure_without_observed_depletion_is_ignored(self):
+    def test_recovered_quota_failure_resumes_without_observing_depletion(self):
         self.recover()
-        self.assertIn("未观察到", self.monitor.tick())
+        self.assertIn("已发送", self.monitor.tick())
+        self.monitor.tick()
+        self.assertEqual(len(self.desktop.messages), 1)
+
+    def test_recorded_error_without_code_waits_for_recovery(self):
+        self.desktop.snapshot["turns"][0]["error"] = copy.deepcopy(RECORDED_QUOTA_ERROR)
+        self.assertIn("等待恢复", self.monitor.tick())
+        self.assertEqual(self.desktop.messages, [])
+        self.recover()
+        self.assertIn("已发送", self.monitor.tick())
+        self.assertEqual(len(self.desktop.messages), 1)
+
+    def test_recorded_error_first_seen_after_recovery_resumes_once(self):
+        self.desktop.snapshot["turns"][0]["error"] = copy.deepcopy(RECORDED_QUOTA_ERROR)
+        self.recover()
+        self.assertIn("已发送", self.monitor.tick())
+        self.monitor.tick()
+        self.assertEqual(len(self.desktop.messages), 1)
+
+    def test_open_monitor_only_after_task_has_hit_quota(self):
+        desktop = FakeDesktop()
+        desktop.snapshot["turns"][0]["error"] = copy.deepcopy(RECORDED_QUOTA_ERROR)
+        # The task has already failed before the helper or its state file exists.
+        path = Path(self.temp.name) / "opened-after-quota.json"
+        self.assertFalse(path.exists())
+        monitor = Monitor(path, desktop, threading.Event())
+        monitor.bind("selected-thread")
+        self.assertIn("等待恢复", monitor.tick())
+        self.assertEqual(desktop.messages, [])
+        desktop.usage = usage(0, True)
+        self.assertIn("已发送", monitor.tick())
+        monitor.tick()
+        self.assertEqual(len(desktop.messages), 1)
+        self.assertEqual(desktop.messages[0]["threadId"], "selected-thread")
+
+    def test_error_text_in_assistant_message_does_not_trigger(self):
+        turn = self.desktop.snapshot["turns"][0]
+        turn["error"] = {"message": "Network request failed"}
+        turn["items"] = [{"type": "agentMessage", "text": RECORDED_QUOTA_ERROR["message"]}]
+        self.recover()
+        self.monitor.tick()
+        self.assertEqual(self.desktop.messages, [])
+
+    def test_other_error_code_is_not_overridden_by_message(self):
+        self.desktop.snapshot["turns"][0]["error"] = {
+            **RECORDED_QUOTA_ERROR, "codexErrorInfo": "responseStreamDisconnected"}
+        self.recover()
+        self.monitor.tick()
+        self.assertEqual(self.desktop.messages, [])
+
+    def test_interrupted_turn_with_recorded_error_is_not_resumed(self):
+        turn = self.desktop.snapshot["turns"][0]
+        turn["status"] = "interrupted"
+        turn["error"] = copy.deepcopy(RECORDED_QUOTA_ERROR)
+        self.recover()
+        self.monitor.tick()
+        self.assertEqual(self.desktop.messages, [])
+
+    def test_quota_snapshot_refreshes_while_task_is_active(self):
+        self.desktop.snapshot = snapshot("inProgress", active=True)
+        self.recover()
+        self.monitor.tick()
+        self.assertEqual(self.monitor.current_usage, self.desktop.usage)
         self.assertEqual(self.desktop.messages, [])
 
     def test_new_manual_turn_cancels_pending(self):

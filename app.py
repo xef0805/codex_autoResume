@@ -34,7 +34,7 @@ class App:
         frame = ttk.Frame(root, padding=22)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="额度恢复后，继续原任务", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="只监控你选择的一个聊天。打开工具不会自动续跑。", padding=(0, 8, 0, 16)).pack(anchor="w")
+        ttk.Label(frame, text="额度用完后再打开，选择中断的聊天并开启监控。", padding=(0, 8, 0, 16)).pack(anchor="w")
         row = ttk.Frame(frame)
         row.pack(fill="x")
         self.choice = ttk.Combobox(row, state="readonly")
@@ -99,6 +99,8 @@ class App:
                         raise
                     except Exception as error:
                         status = "连接暂时不可用，下次重试：" + str(error)
+                    if monitor.current_usage is not None:
+                        self.events.put(("quota", quota_description(monitor.current_usage)))
                     self.events.put(("status", status))
                     if self.stopped.wait(60):
                         break
@@ -146,7 +148,7 @@ class App:
                 self.refresh_button.configure(state="normal")
                 self.record(value)
             elif event == "quota":
-                self.quota.set(value)
+                self.quota.set(value + "（" + time.strftime("%H:%M:%S") + " 查询）")
             elif event == "stopped":
                 self.set_running(False)
                 if self.status.get().startswith("正在停止"):
